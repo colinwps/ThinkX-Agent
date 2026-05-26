@@ -84,7 +84,7 @@ class Agent:
         approval_callback: ApprovalCallback | None = None,
         tracer: Tracer | None = None,
         retry_policy: RetryPolicy | None = None,
-        model: str = "deepseek-chat",
+        model: str = "deepseek-v4-flash",
         base_url: str = "https://api.deepseek.com/v1",
         api_key: str | None = None,
         max_iterations: int = 15,
