@@ -26,17 +26,17 @@ ThinkX-Agent/
 │   ├── session.py / streaming.py / approval.py / cli.py / __init__.py
 │   ├── tools/
 │   │   ├── base.py / registry.py / builtin.py
-│   │   └── mcp_client.py             # ★ v4: 接受 retry_policy + env
+│   │   └── mcp_client.py             
 │   ├── skills/
-│   ├── observability/                # v3
-│   └── robustness/                   # ★ v4 新增
+│   ├── observability/                
+│   └── robustness/                   
 │       ├── guards.py                 #   ToolResultGuard + CommandValidator
 │       ├── timeout.py                #   超时控制
 │       ├── retry.py                  #   RetryPolicy + LLM/MCP 策略
 │       └── llm_client.py             #   ResilientOpenAI
 ├── mcp_servers/
 │   ├── demo_server.py
-│   └── library/                      # ★ v4 新增
+│   └── library/                      
 │       ├── db.py                     #   SQLite + DAO (只读)
 │       ├── seed.py                   #   种子数据生成
 │       └── server.py                 #   FastMCP server (6 工具)
