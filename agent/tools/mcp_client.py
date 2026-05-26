@@ -27,13 +27,35 @@ class MCPClient:
     这里用一个常驻的后台事件循环线程, 把异步调用同步化。
     """
 
-    def __init__(self, command: str, args: list[str], name: str = "mcp"):
+    def __init__(
+        self,
+        command: str,
+        args: list[str],
+        name: str = "mcp",
+        retry_policy=None,
+        env: dict[str, str] | None = None,
+    ):
         """
         command + args 指定怎么启动 MCP Server 子进程。
         例如: command="python", args=["mcp_servers/demo_server.py"]
+
+        retry_policy: 给 call_tool 加重试(可选)。MCP 通过 stdio 通信,
+                      偶发的 IO 中断/超时通过重试可恢复。
+
+        env: 显式传给子进程的环境变量。
+             ⚠ MCP SDK 默认 不会 把父进程环境继承给子进程(安全考虑)。
+             如果你的 MCP server 依赖某些环境变量(如 LIBRARY_DB_PATH、API_KEY),
+             必须在这里显式传入。常见用法: env=os.environ.copy() 全继承。
         """
         self.name = name
-        self.params = StdioServerParameters(command=command, args=args)
+        # 注意 env=None 时 MCP SDK 默认不传任何环境给子进程
+        # 这里把 env 也加进去
+        self.params = StdioServerParameters(
+            command=command,
+            args=args,
+            env=env,
+        )
+        self._retry_policy = retry_policy
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -123,7 +145,15 @@ class MCPClient:
         ]
 
     def call_tool(self, name: str, arguments: dict) -> str:
-        """调用一个 MCP 工具, 返回纯文本结果"""
+        """调用一个 MCP 工具, 返回纯文本结果。装了 retry_policy 时自动重试"""
+        if self._retry_policy is None:
+            return self._call_tool_raw(name, arguments)
+
+        from ..robustness.retry import retry
+        return retry(self._retry_policy)(self._call_tool_raw)(name, arguments)
+
+    def _call_tool_raw(self, name: str, arguments: dict) -> str:
+        """单次调用, 不重试"""
         result = self._run_async(self._session.call_tool(name, arguments))
 
         # MCP 工具返回的是 content blocks 列表, 可能包含 text / image / 等
@@ -137,6 +167,7 @@ class MCPClient:
 
         text = "\n".join(parts)
         if result.isError:
+            # 业务错误不重试 -> 直接返回文本, 不抛异常
             return f"[MCP 工具错误] {text}"
         return text
 

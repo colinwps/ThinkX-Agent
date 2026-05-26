@@ -35,6 +35,7 @@ from .core import (
     ToolCallResult,
     ToolCallStart,
 )
+from .observability import list_traces, show_span, show_summary, show_trace
 from .session import Session, SessionStore
 
 
@@ -93,10 +94,12 @@ class REPL:
         self,
         agent: Agent,
         store: SessionStore,
+        trace_store=None,  # Optional[TraceStore]
         history_file: str = "~/.my-agent/repl_history",
     ):
         self.agent = agent
         self.store = store
+        self.trace_store = trace_store  # 可以从 agent.tracer.store 拿, 但这里显式存
         self.session: Session | None = None  # 当前活跃会话
 
         # 把 cli 审批回调装到 agent 上
@@ -135,6 +138,10 @@ class REPL:
         "/yolo": "切换到全自动模式(不再询问)",
         "/careful": "切换到所有工具都要确认的偏执模式",
         "/safe": "回到默认安全模式(危险工具要确认)",
+        "/traces [n]": "列出最近 n 条 trace (默认 10)",
+        "/trace <id>": "查看某个 trace 的详细执行轨迹",
+        "/span <id>": "查看某个 span 的完整 payload",
+        "/cost": "显示总成本/token 统计",
         "/quit, /exit, /q": "退出",
     }
 
@@ -178,6 +185,14 @@ class REPL:
         elif cmd == "/safe":
             self.agent.approval_policy = ApprovalPolicy.default_safe()
             console.print("[green]🛡  安全模式: 危险工具会询问[/]")
+        elif cmd == "/traces":
+            self.cmd_traces(arg)
+        elif cmd == "/trace":
+            self.cmd_trace(arg)
+        elif cmd == "/span":
+            self.cmd_span(arg)
+        elif cmd == "/cost":
+            self.cmd_cost()
         else:
             console.print(f"[red]未知命令: {cmd}[/], 输入 /help 查看")
         return True
@@ -281,6 +296,55 @@ class REPL:
             desc = s.description[:80]
             table.add_row(s.name, desc)
         console.print(table)
+
+    # ----- trace 相关命令 -----
+
+    def _get_trace_store(self):
+        ts = self.trace_store
+        if ts is None and self.agent.tracer is not None:
+            ts = self.agent.tracer.store
+        if ts is None:
+            console.print("[yellow]⚠ tracer 未启用, 无 trace 数据[/]")
+            return None
+        return ts
+
+    def cmd_traces(self, arg: str):
+        ts = self._get_trace_store()
+        if ts is None:
+            return
+        try:
+            n = int(arg) if arg.strip() else 10
+        except ValueError:
+            n = 10
+        # 默认只看当前 session 的 trace; 没 session 就全部
+        session_id = self.session.id if self.session else None
+        list_traces(ts, console, limit=n, session_id=session_id)
+        if session_id:
+            console.print(f"[dim](只显示当前会话 {session_id} 的 trace, 看全部用 /traces 后无参数 + 加大 n)[/]")
+
+    def cmd_trace(self, arg: str):
+        ts = self._get_trace_store()
+        if ts is None:
+            return
+        if not arg.strip():
+            console.print("[red]用法: /trace <trace_id>[/]")
+            return
+        show_trace(ts, console, arg.strip())
+
+    def cmd_span(self, arg: str):
+        ts = self._get_trace_store()
+        if ts is None:
+            return
+        if not arg.strip():
+            console.print("[red]用法: /span <span_id (前 8 位即可)>[/]")
+            return
+        show_span(ts, console, arg.strip())
+
+    def cmd_cost(self):
+        ts = self._get_trace_store()
+        if ts is None:
+            return
+        show_summary(ts, console)
 
     # ---------- 会话管理 ----------
 

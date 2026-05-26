@@ -1,59 +1,65 @@
-# ThinkX-Agent (会话 + 流式 + REPL)
+# ThinkX-Agent (ColinApp)
 
 从零实现的最小 Agent 框架。
 
-## 特性
 
-###  基础能力
-- ✅ ReAct 主循环(多轮工具调用)
-- ✅ Tool 抽象 + `@tool` 装饰器(Pydantic 自动生成 schema)
-- ✅ MCP Client(通过 stdio 接入任意 MCP Server)
-- ✅ MCP Server 示例(基于 FastMCP)
-- ✅ Skill 系统(按需加载的方法论, 带可执行脚本)
-- ✅ 模型无关(DeepSeek / 通义 / 智谱 / Kimi 换 base_url 即可)
-- ✅ **Session 会话化**: Agent 无状态, 状态在 Session 里
-- ✅ **SQLite 持久化**: 会话历史自动保存, 重启后能恢复
-- ✅ **流式输出**: 文字逐字到达, 体验质变
-- ✅ **事件流接口**: `run_stream()` 返回 Event 序列, CLI / Web 都能用
-- ✅ **工具调用审批**: 危险工具默认要确认 (y/n/a)
-- ✅ **CLI REPL**: 完整的命令行交互(历史、流式、确认、斜杠命令)
-- ✅ **Token 统计**: 每次会话累计 token 用量
+### 稳健性子系统 (`agent/robustness/`)
+- ✅ **工具结果护栏** - 超长输出自动截断, 中间省略给模型明确提示
+- ✅ **Shell 命令黑名单** - 拦截 `rm -rf /`、`mkfs.*`、`curl | bash` 等明显恶意命令
+- ✅ **超时控制** - 线程级超时, 超时后任由后台跑完(不强杀)
+- ✅ **重试 + 退避** - 指数退避 + 抖动, 区分可重试/不可重试错误
+- ✅ **LLM 客户端外壳** - `ResilientOpenAI` 自动重试网络错误
+- ✅ **MCP 客户端重试** - MCPClient 接受 retry_policy, IO 抖动自动恢复
+
+### 业务接入: 智能图书馆查询助手 (`mcp_servers/library/`)
+- ✅ SQLite 数据库 + 种子数据(12 本图书、5 读者、8 借阅记录)
+- ✅ 6 个 MCP 查询工具(只读): 图书/读者/借阅/超期/统计
+- ✅ Server 端手机号自动脱敏(138****8001)
+- ✅ 完整集成所有子系统: trace、护栏、重试、审批
 
 ## 项目结构
 
 ```
 ThinkX-Agent/
 ├── agent/
-│   ├── core.py              # Agent 主循环 (无状态, 流式)
-│   ├── session.py           # Session + SessionStore (SQLite)
-│   ├── streaming.py         # 流式 chunks 累加器
-│   ├── approval.py          # 工具审批策略
-│   ├── cli.py               # CLI REPL (斜杠命令、流式渲染、确认)
-│   ├── tools/...            # Tools
-│   └── skills/...           # Skills
-├── mcp_servers/...
-├── skills/...
-└── examples/
-    ├── 01_minimal_loop.py   # 
-    ├── 02_with_tools.py     # v1
-    ├── 03_with_mcp.py       # v1
-    ├── 04_with_skills.py    # v1
-    ├── 05_chat.py           # 多轮对话 + 持久化
-    ├── 06_streaming.py      # 流式输出
-    └── 07_repl.py           # 启动 REPL
+│   ├── core.py                       # Agent 主循环
+│   ├── session.py / streaming.py / approval.py / cli.py / __init__.py
+│   ├── tools/
+│   │   ├── base.py / registry.py / builtin.py
+│   │   └── mcp_client.py             # ★ v4: 接受 retry_policy + env
+│   ├── skills/
+│   ├── observability/                # v3
+│   └── robustness/                   # ★ v4 新增
+│       ├── guards.py                 #   ToolResultGuard + CommandValidator
+│       ├── timeout.py                #   超时控制
+│       ├── retry.py                  #   RetryPolicy + LLM/MCP 策略
+│       └── llm_client.py             #   ResilientOpenAI
+├── mcp_servers/
+│   ├── demo_server.py
+│   └── library/                      # ★ v4 新增
+│       ├── db.py                     #   SQLite + DAO (只读)
+│       ├── seed.py                   #   种子数据生成
+│       └── server.py                 #   FastMCP server (6 工具)
+├── skills/
+├── examples/
+│   ├── 01_minimal_loop.py … 08_tracing.py
+│   ├── 09_robustness.py              # ★ v4: 稳健性单点演示
+│   └── 10_library_agent.py           # ★ v4: 图书馆 REPL 实战
+└── trace_cli.py
 ```
 
 ## 快速开始
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env  # 填 DEEPSEEK_API_KEY
 
-cp .env.example .env  # 填入 DEEPSEEK_API_KEY
+# 1. 看稳健性单点能力(不需要 LLM)
+python -m examples.09_robustness
 
-# 直接进 REPL
-python -m examples.07_repl
+# 2. 体验业务 Agent: 图书馆查询助手
+python -m examples.10_library_agent
 ```
 
 ## REPL 内置命令
@@ -89,3 +95,79 @@ python -m examples.07_repl
 
 默认存到 `~/.my-agent/sessions.db` (SQLite, 可拷贝可分享)。
 每次 REPL 退出 / 工具调用后都会自动保存。
+
+
+### 工具结果护栏
+
+```python
+from agent.robustness import ToolResultGuard, guard_tool
+
+guard = ToolResultGuard(max_chars=8000)
+safe_tool = guard_tool(my_tool, guard)
+# 超过 8000 字符 -> 自动截断 + 给模型提示
+```
+
+### Shell 命令黑名单
+
+```python
+from agent.robustness import CommandValidator
+from agent.robustness.guards import make_safe_shell_tool
+
+safe_shell = make_safe_shell_tool(run_shell, CommandValidator.default())
+# rm -rf / 等会被拒绝
+```
+
+### LLM 自动重试
+
+```python
+from agent import Agent
+from agent.robustness import default_llm_retry_policy
+
+agent = Agent(
+    registry=registry,
+    retry_policy=default_llm_retry_policy(),  # 不传也行, Agent 默认就装
+)
+# 网络抖动 / 429 / 5xx 自动重试 3 次, 指数退避
+```
+
+### MCP 自动重试
+
+```python
+from agent.tools.mcp_client import MCPClient
+from agent.robustness import default_mcp_retry_policy
+
+mcp = MCPClient(
+    command="python",
+    args=["server.py"],
+    retry_policy=default_mcp_retry_policy(),
+    env=os.environ.copy(),  # ⚠ MCP SDK 默认不传父进程环境
+)
+```
+
+### 自定义重试策略
+
+```python
+from agent.robustness import RetryPolicy
+
+custom = RetryPolicy(
+    max_attempts=5,
+    base_delay=0.5,
+    max_delay=10.0,
+    retry_on=lambda e: isinstance(e, ConnectionError),
+    on_retry=lambda attempt, err, delay: log_to_my_system(...),
+)
+```
+
+## 图书馆 Agent: 可以这样问
+
+```
+> 查一下三体这本书还有库存吗
+> 技术类有什么书
+> 13800138001 是谁? 他现在借了什么? 有罚款吗?
+> 读者 R002 借过哪些书
+> 全馆现在有哪些书超期没还
+> 图书馆最热门的书是哪本
+```
+
+模型会自己规划查询路径, 每一步都被 trace 记录, 敏感信息自动脱敏。
+
