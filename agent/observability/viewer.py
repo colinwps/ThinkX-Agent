@@ -288,13 +288,32 @@ def show_summary(
     agg = store.aggregate_cost(since=since, until=until)
     by_model = store.aggregate_by_model()
 
+    # 估算 cache 节省 (按所有模型加权 - 实际只有 DeepSeek 有 cache)
+    cache_saving = 0.0
+    if agg["cached_tokens"] > 0:
+        for row in by_model:
+            pricing = _safe_get_pricing(row["model"])
+            if pricing and pricing.cached_input_per_1m < pricing.input_per_1m:
+                # 这个模型的 cache 比例
+                # 简化: 用全局命中率平摊
+                model_cache = int(
+                    row["prompt_tokens"] * agg["cached_tokens"] / max(1, agg["prompt_tokens"])
+                )
+                cache_saving += model_cache * (
+                    pricing.input_per_1m - pricing.cached_input_per_1m
+                ) / 1_000_000
+
+    cache_pct = (agg["cached_tokens"] / max(1, agg["prompt_tokens"])) * 100
+
     lines = [
         f"[bold]Trace 数:[/] {agg['trace_count']}",
         f"[bold]LLM 调用:[/] {agg['llm_calls']}",
         f"[bold]工具调用:[/] {agg['tool_calls']}",
-        f"[bold]总输入 tokens:[/] {agg['prompt_tokens']} (cached: {agg['cached_tokens']})",
-        f"[bold]总输出 tokens:[/] {agg['completion_tokens']}",
-        f"[bold]总成本:[/] [green]{format_cost(agg['cost_usd'])}[/]",
+        f"[bold]总输入 tokens:[/] {agg['prompt_tokens']:,}",
+        f"  [dim]├ cache 命中:[/] {agg['cached_tokens']:,} ({cache_pct:.1f}%)",
+        f"  [dim]└ 节省金额:[/] [green]~{format_cost(cache_saving)}[/]",
+        f"[bold]总输出 tokens:[/] {agg['completion_tokens']:,}",
+        f"[bold]实际总成本:[/] [green]{format_cost(agg['cost_usd'])}[/]",
     ]
     console.print(Panel("\n".join(lines), border_style="green", title="累计统计"))
 
@@ -316,3 +335,8 @@ def show_summary(
                 format_cost(row["cost_usd"] or 0),
             )
         console.print(table)
+
+
+def _safe_get_pricing(model: str):
+    from .pricing import get_pricing
+    return get_pricing(model)

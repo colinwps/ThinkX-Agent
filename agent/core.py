@@ -1,5 +1,5 @@
 """
-Agent 主循环 —— v3: 会话化 + 流式 + 工具审批 + 可观测性
+Agent 主循环 —— v6: + 上下文管理(prompt cache + 历史压缩 + 预算)
 
 设计变化:
 - Agent 自己不存 messages, 而是操作传入的 Session
@@ -7,18 +7,20 @@ Agent 主循环 —— v3: 会话化 + 流式 + 工具审批 + 可观测性
 - run() 同步阻塞接口; run_stream() 流式接口
 - 工具调用前过 approval 钩子(没传就默认全放行)
 - 关键节点埋点写入 Tracer(可选, 不传就完全 no-op)
+- 调 LLM 前过 budget 检查, 必要时压缩历史
 """
 from __future__ import annotations
 
 import json
 import os
-from typing import Iterator
+from typing import Iterator, Optional
 
 from openai import OpenAI
 from rich import print as rprint
 from rich.panel import Panel
 
 from .approval import ApprovalCallback, ApprovalPolicy, Decision, auto_approve
+from .context.budget import BudgetManager
 from .observability.models import SpanKind
 from .observability.tracer import Tracer, record_llm_usage
 from .robustness.llm_client import ResilientOpenAI
@@ -71,6 +73,16 @@ class Aborted(Event):
         self.reason = reason
 
 
+class ContextCompressed(Event):
+    """触发了历史压缩"""
+    def __init__(self, messages_before: int, messages_after: int,
+                 tokens_before: int, tokens_after: int):
+        self.messages_before = messages_before
+        self.messages_after = messages_after
+        self.tokens_before = tokens_before
+        self.tokens_after = tokens_after
+
+
 # ============================================================
 # Agent
 # ============================================================
@@ -84,7 +96,8 @@ class Agent:
         approval_callback: ApprovalCallback | None = None,
         tracer: Tracer | None = None,
         retry_policy: RetryPolicy | None = None,
-        model: str = "deepseek-v4-flash",
+        budget_manager: Optional[BudgetManager] = None,
+        model: str = "deepseek-chat",
         base_url: str = "https://api.deepseek.com/v1",
         api_key: str | None = None,
         max_iterations: int = 15,
@@ -94,6 +107,7 @@ class Agent:
         self.approval_policy = approval_policy or ApprovalPolicy()
         self.approval_callback = approval_callback or auto_approve
         self.tracer = tracer  # 可选: 没传就不记录
+        self.budget_manager = budget_manager  # 可选: 没传就不做预算管理
         self.model = model
         self.max_iterations = max_iterations
 
@@ -101,7 +115,6 @@ class Agent:
             self._install_skill_support()
 
         # 用 ResilientOpenAI(retry 装饰过的) 替代裸 OpenAI
-        # 传 None 走默认的 LLM 重试策略
         self.client = ResilientOpenAI(
             api_key=api_key or os.getenv("DEEPSEEK_API_KEY"),
             base_url=base_url,
@@ -256,8 +269,29 @@ class Agent:
         for iteration in range(self.max_iterations):
             yield IterationStart(iteration + 1)
 
-            # ----- 调 LLM(流式) + LLM_CALL span -----
+            # ----- 预算检查 + 必要时压缩历史 -----
             messages_snapshot = session.to_llm_messages()
+            if self.budget_manager is not None:
+                new_msgs, check = self.budget_manager.check_and_compress(messages_snapshot)
+                if check.compressed and check.compression is not None:
+                    # 真的发生了压缩 -> 把压缩后的 messages 写回 session
+                    # 注意: 摘要被插在了开头(system 角色), 原 system_prompt 被替代
+                    # 为保留原 system_prompt, 我们手动恢复
+                    summary_msg = new_msgs[0]  # 压缩生成的摘要 (system)
+                    rest = new_msgs[1:]         # 保留的最近 N 条
+                    # 重建 session.messages: 摘要 + rest
+                    # session.system_prompt 仍单独保留, 会在 to_llm_messages 时拼回最前
+                    session.messages = [summary_msg] + rest
+                    messages_snapshot = session.to_llm_messages()
+
+                    yield ContextCompressed(
+                        messages_before=check.compression.messages_before,
+                        messages_after=check.compression.messages_after,
+                        tokens_before=check.compression.tokens_before,
+                        tokens_after=check.compression.tokens_after,
+                    )
+
+            # ----- 调 LLM(流式) + LLM_CALL span -----
             with trace_ctx.span(
                 SpanKind.LLM_CALL,
                 name=self.model,
@@ -265,6 +299,8 @@ class Agent:
             ) as llm_span:
                 # 记录 prompt(进 payload, 会被 redactor 处理)
                 llm_span.set_payload("messages", messages_snapshot)
+                llm_span.set_attribute("estimated_tokens",
+                    self.budget_manager.estimate(messages_snapshot) if self.budget_manager else 0)
 
                 stream = self.client.chat.completions.create(
                     model=self.model,
