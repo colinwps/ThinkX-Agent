@@ -41,8 +41,8 @@ class TokenUsage:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
 
-    def add(self, usage: Any) -> None:
-        """从 LLM 响应的 usage 字段累加"""
+    def add(self, usage: Any, model: str = "") -> None:
+        """从 LLM 响应的 usage 字段累加。model 用于按模型分发读 cache 字段。"""
         if usage is None:
             return
         self.calls += 1
@@ -50,11 +50,16 @@ class TokenUsage:
         self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
         self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
 
-        # DeepSeek/Kimi 等返回的 cache 命中 token
-        details = getattr(usage, "prompt_tokens_details", None)
-        if details is not None:
-            cached = getattr(details, "cached_tokens", 0) or 0
-            self.cached_tokens += cached
+        # 多模型 cache 字段统一读取
+        if model:
+            from .observability.pricing import extract_cache_info
+            self.cached_tokens += extract_cache_info(model, usage)
+        else:
+            # 没 model 时退化到通用字段
+            details = getattr(usage, "prompt_tokens_details", None)
+            if details is not None:
+                cached = getattr(details, "cached_tokens", 0) or 0
+                self.cached_tokens += cached
 
     def summary(self) -> str:
         cache_info = f", cached: {self.cached_tokens}" if self.cached_tokens else ""
@@ -85,14 +90,16 @@ class Session:
 
     # ----- 消息操作 -----
 
-    def to_llm_messages(self) -> list[dict]:
+    def to_llm_messages(self, system_override: str | None = None) -> list[dict]:
         """
         生成传给 LLM 的 messages 列表(system + history)
         每次都重建, 因为 system_prompt 可能被外部更新(比如 skill catalog)
+        system_override: 临时覆盖 system_prompt(plan 阶段用), 不写回 session
         """
         msgs = []
-        if self.system_prompt:
-            msgs.append({"role": "system", "content": self.system_prompt})
+        sp = system_override if system_override is not None else self.system_prompt
+        if sp:
+            msgs.append({"role": "system", "content": sp})
         msgs.extend(self.messages)
         return msgs
 

@@ -2,13 +2,12 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>ThinkX Agent · 对话演示</title>
+<title>my-agent · 对话演示</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -229,76 +228,10 @@ html, body, #root {
 
 .msg-assistant {
   padding: 4px 0;
+  white-space: pre-wrap;
   word-wrap: break-word;
   line-height: 1.7;
 }
-
-/* Markdown 渲染样式 */
-.msg-assistant p { margin: 0 0 10px; }
-.msg-assistant p:last-child { margin-bottom: 0; }
-.msg-assistant h1, .msg-assistant h2, .msg-assistant h3,
-.msg-assistant h4, .msg-assistant h5, .msg-assistant h6 {
-  font-weight: 600;
-  margin: 16px 0 8px;
-  line-height: 1.4;
-}
-.msg-assistant h1 { font-size: 1.3em; }
-.msg-assistant h2 { font-size: 1.15em; }
-.msg-assistant h3 { font-size: 1.05em; }
-.msg-assistant ul, .msg-assistant ol {
-  margin: 6px 0 10px 20px;
-  padding: 0;
-}
-.msg-assistant li { margin-bottom: 4px; }
-.msg-assistant code {
-  background: #f0f0f0;
-  border-radius: 4px;
-  padding: 1px 5px;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 12.5px;
-  color: #d63384;
-}
-.msg-assistant pre {
-  background: #1e1e1e;
-  color: #d4d4d4;
-  border-radius: 8px;
-  padding: 14px 16px;
-  overflow-x: auto;
-  margin: 10px 0;
-  font-size: 13px;
-  line-height: 1.6;
-}
-.msg-assistant pre code {
-  background: none;
-  padding: 0;
-  color: inherit;
-  font-size: inherit;
-}
-.msg-assistant blockquote {
-  border-left: 3px solid #d4d4d4;
-  margin: 8px 0;
-  padding: 4px 12px;
-  color: #666;
-  background: #f8f8f8;
-  border-radius: 0 4px 4px 0;
-}
-.msg-assistant table {
-  border-collapse: collapse;
-  width: 100%;
-  margin: 10px 0;
-  font-size: 13px;
-}
-.msg-assistant th, .msg-assistant td {
-  border: 1px solid #e0e0e0;
-  padding: 6px 12px;
-  text-align: left;
-}
-.msg-assistant th { background: #f5f5f5; font-weight: 600; }
-.msg-assistant tr:nth-child(even) { background: #fafafa; }
-.msg-assistant a { color: #2563eb; text-decoration: underline; }
-.msg-assistant strong { font-weight: 600; }
-.msg-assistant em { font-style: italic; }
-.msg-assistant hr { border: none; border-top: 1px solid #e5e5e5; margin: 12px 0; }
 
 .msg-assistant.streaming::after {
   content: '▋';
@@ -660,20 +593,6 @@ async function* streamMessages(sessionId, message) {
 }
 
 // ============================================================
-// Markdown 渲染工具
-// ============================================================
-function parseMarkdown(text) {
-  if (!text) return '';
-  if (typeof marked === 'undefined') return text;
-  try {
-    marked.setOptions({ breaks: true, gfm: true });
-    return marked.parse(text);
-  } catch (e) {
-    return text;
-  }
-}
-
-// ============================================================
 // 子组件
 // ============================================================
 
@@ -718,10 +637,9 @@ function Turn({turn, isStreaming}) {
         </div>
       )}
       {(turn.assistant || isStreaming) && (
-        <div
-          className={`msg-assistant ${isStreaming ? 'streaming' : ''}`}
-          dangerouslySetInnerHTML={{__html: parseMarkdown(turn.assistant) || ''}}
-        />
+        <div className={`msg-assistant ${isStreaming ? 'streaming' : ''}`}>
+          {turn.assistant}
+        </div>
       )}
     </div>
   );
@@ -1022,8 +940,8 @@ function App() {
       {/* 侧边栏 */}
       <div className="sidebar">
         <div className="sidebar-header">
-          <div className="sidebar-title">✦ ThinkX Agent</div>
-          <div className="sidebar-subtitle">AI智能体 v3</div>
+          <div className="sidebar-title">🤖 my-agent</div>
+          <div className="sidebar-subtitle">图书馆查询助手 · v5</div>
           <button className="btn-new" onClick={handleNew}>+ 新建会话</button>
         </div>
 

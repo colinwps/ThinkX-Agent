@@ -23,10 +23,13 @@ from .approval import ApprovalCallback, ApprovalPolicy, Decision, auto_approve
 from .context.budget import BudgetManager
 from .observability.models import SpanKind
 from .observability.tracer import Tracer, record_llm_usage
+from .parallel import execute_tools_parallel
 from .robustness.llm_client import ResilientOpenAI
 from .robustness.retry import RetryPolicy
 from .session import Session
 from .skills.manager import SkillManager
+from .strategies.plan import Planner, PlanResult
+from .strategies.reflect import Reflector, ReflectionResult
 from .streaming import consume_stream
 from .tools.base import Tool
 from .tools.registry import ToolRegistry
@@ -83,6 +86,21 @@ class ContextCompressed(Event):
         self.tokens_after = tokens_after
 
 
+class PlanGenerated(Event):
+    """生成了执行计划 (A4 Plan-and-Execute)"""
+    def __init__(self, steps: list[str], raw_response: str = ""):
+        self.steps = steps
+        self.raw_response = raw_response
+
+
+class ReflectionDone(Event):
+    """反思评估完成 (A5 Reflection)"""
+    def __init__(self, score: int, suggestions: str, retry_triggered: bool):
+        self.score = score
+        self.suggestions = suggestions
+        self.retry_triggered = retry_triggered
+
+
 # ============================================================
 # Agent
 # ============================================================
@@ -97,6 +115,12 @@ class Agent:
         tracer: Tracer | None = None,
         retry_policy: RetryPolicy | None = None,
         budget_manager: Optional[BudgetManager] = None,
+        parallel_tools: bool = False,
+        planner: Optional[Planner] = None,
+        plan_first: bool = False,
+        reflector: Optional[Reflector] = None,
+        reflect: bool = False,
+        reflect_threshold: int = 7,
         model: str = "deepseek-chat",
         base_url: str = "https://api.deepseek.com/v1",
         api_key: str | None = None,
@@ -106,8 +130,19 @@ class Agent:
         self.skill_manager = skill_manager
         self.approval_policy = approval_policy or ApprovalPolicy()
         self.approval_callback = approval_callback or auto_approve
-        self.tracer = tracer  # 可选: 没传就不记录
-        self.budget_manager = budget_manager  # 可选: 没传就不做预算管理
+        self.tracer = tracer
+        self.budget_manager = budget_manager
+        self.parallel_tools = parallel_tools
+
+        # Plan-and-Execute
+        self.planner = planner
+        self.plan_first = plan_first
+
+        # Reflection
+        self.reflector = reflector
+        self.reflect = reflect
+        self.reflect_threshold = reflect_threshold
+
         self.model = model
         self.max_iterations = max_iterations
 
@@ -229,8 +264,11 @@ class Agent:
         这么做是为了让 generator 和 context manager 能正确配合(yield 不能跨越 with 边界)
         """
         if self.tracer is None:
-            # 没装 tracer 的情况: 直接走内层, 不开 trace
-            yield from self._run_stream_inner(session, user_input, trace_ctx=None)
+            # 没装 tracer 的情况: 给一个 noop 上下文, 代码不用改
+            from .observability.tracer import _NoopTraceContext
+            yield from self._run_stream_inner(
+                session, user_input, trace_ctx=_NoopTraceContext()
+            )
             return
 
         # 装了 tracer: 包一层 trace 上下文
@@ -261,16 +299,89 @@ class Agent:
         session.add_user(user_input)
 
         # 每次 run 都重建 system prompt(支持运行时切换 skill / prompt)
-        if not session.system_prompt:
-            session.system_prompt = self.augment_system_prompt(
-                "你是一个有用的助手, 可以使用工具来回答用户问题。需要时主动调用工具, 不要瞎编。"
-            )
+        base_system = (
+            "你是一个有用的助手, 可以使用工具来回答用户问题。需要时主动调用工具, 不要瞎编。"
+        )
 
+        # ----- A4: Plan-and-Execute (可选, 在 ReAct 循环前) -----
+        plan_text = ""
+        if self.plan_first and self.planner is not None:
+            tools_summary = self._render_tools_summary()
+            with trace_ctx.span(SpanKind.LLM_CALL, name="planner") as ps:
+                ps.set_payload("user_task", user_input)
+                plan_result = self.planner.plan(user_input, tools_summary)
+                ps.set_payload("plan_steps", plan_result.steps)
+                ps.set_attribute("valid", plan_result.is_valid)
+                if plan_result.parse_error:
+                    ps.set_attribute("parse_error", plan_result.parse_error)
+
+            if plan_result.is_valid:
+                yield PlanGenerated(plan_result.steps, plan_result.raw_response)
+                plan_text = plan_result.render_for_system()
+
+        if not session.system_prompt:
+            session.system_prompt = self.augment_system_prompt(base_system)
+
+        # 把 plan 临时追加到 system_prompt (只这一轮有效)
+        effective_system = session.system_prompt
+        if plan_text:
+            effective_system = effective_system + "\n\n" + plan_text
+
+        # 执行主循环 - 用一个内部 helper, 因为我们要复用它做 reflection retry
+        final_answer = ""
+        for evt in self._react_loop(session, trace_ctx, effective_system):
+            if isinstance(evt, Done):
+                final_answer = evt.final_text
+            yield evt
+
+        # ----- A5: Reflection (可选, 给完答案后) -----
+        if not self.reflect or self.reflector is None or not final_answer:
+            return
+
+        with trace_ctx.span(SpanKind.LLM_CALL, name="reflector") as rs:
+            rs.set_payload("user_input", user_input)
+            rs.set_payload("assistant_answer", final_answer)
+            reflection = self.reflector.evaluate(user_input, final_answer)
+            rs.set_attribute("score", reflection.score)
+            rs.set_attribute("valid", reflection.is_valid)
+            if reflection.suggestions:
+                rs.set_payload("suggestions", reflection.suggestions)
+
+        needs_retry = reflection.needs_retry(self.reflect_threshold)
+        yield ReflectionDone(
+            score=reflection.score,
+            suggestions=reflection.suggestions,
+            retry_triggered=needs_retry,
+        )
+
+        if not needs_retry:
+            return
+
+        # 触发重答 - 把反思建议作为新的用户消息塞进去
+        retry_prompt = (
+            f"[内部反思: 之前的回答得分 {reflection.score}/10]\n"
+            f"改进建议: {reflection.suggestions}\n\n"
+            f"请基于这些建议, 重新更好地回答原问题。不要解释, 直接给改进后的回答。"
+        )
+        session.add_user(retry_prompt)
+        for evt in self._react_loop(session, trace_ctx, effective_system):
+            yield evt
+
+    def _react_loop(
+        self,
+        session: Session,
+        trace_ctx,
+        effective_system: str | None = None,
+    ) -> Iterator[Event]:
+        """ReAct 主循环。
+        effective_system: 临时覆盖 system_prompt(plan 模式下注入 plan)。
+        None 表示用 session.system_prompt。
+        """
         for iteration in range(self.max_iterations):
             yield IterationStart(iteration + 1)
 
             # ----- 预算检查 + 必要时压缩历史 -----
-            messages_snapshot = session.to_llm_messages()
+            messages_snapshot = session.to_llm_messages(system_override=effective_system)
             if self.budget_manager is not None:
                 new_msgs, check = self.budget_manager.check_and_compress(messages_snapshot)
                 if check.compressed and check.compression is not None:
@@ -282,7 +393,7 @@ class Agent:
                     # 重建 session.messages: 摘要 + rest
                     # session.system_prompt 仍单独保留, 会在 to_llm_messages 时拼回最前
                     session.messages = [summary_msg] + rest
-                    messages_snapshot = session.to_llm_messages()
+                    messages_snapshot = session.to_llm_messages(system_override=effective_system)
 
                     yield ContextCompressed(
                         messages_before=check.compression.messages_before,
@@ -335,7 +446,7 @@ class Agent:
                 yield TextChunk(piece)
 
             # 更新会话状态
-            session.usage.add(streamed.usage)
+            session.usage.add(streamed.usage, model=self.model)
             session.add_message(streamed.to_message_dict())
 
             # ----- 情况 A: 没有工具调用, 流程结束 -----
@@ -343,47 +454,126 @@ class Agent:
                 yield Done(streamed.content)
                 return
 
-            # ----- 情况 B: 有工具调用, 逐个处理(含审批) -----
+            # ----- 情况 B: 有工具调用, 串行 OR 并行 -----
+            # 先解析所有参数 + yield ToolCallStart 事件(顺序保留)
+            parsed_calls = []  # 每项: (tc, args, parse_error)
             for tc in streamed.tool_calls:
-                # 解析参数 JSON
                 try:
                     args = json.loads(tc.arguments) if tc.arguments else {}
                     parse_error = None
                 except json.JSONDecodeError as e:
                     args = {}
                     parse_error = str(e)
-
+                parsed_calls.append((tc, args, parse_error))
                 yield ToolCallStart(tc.name, args, tc.id)
 
-                # TOOL_CALL span 包住整个工具执行(含审批)
-                with trace_ctx.span(
-                    SpanKind.TOOL_CALL,
-                    name=tc.name,
-                    tool_call_id=tc.id,
-                ) as tool_span:
-                    tool_span.set_payload("arguments", args)
+            # 真正执行: 串行 OR 并行
+            if not self.parallel_tools or len(parsed_calls) <= 1:
+                # ----- 串行路径 (默认) -----
+                for tc, args, parse_error in parsed_calls:
+                    result, approved = self._execute_one_with_span(
+                        tc.name, tc.id, args, parse_error, trace_ctx,
+                    )
+                    yield ToolCallResult(tc.name, tc.id, result, approved=approved)
+                    session.add_message({
+                        "role": "tool", "tool_call_id": tc.id, "content": result,
+                    })
+            else:
+                # ----- 并行路径 -----
+                # 把"含 span 的执行"包成 executor_fn
+                # 注意: 并行下每个工具的 span 仍是 trace_run 的直接子节点
+                #       (TOOL_CALL span 不互相嵌套, 与串行行为一致)
 
-                    if parse_error:
-                        result = f"[错误] 参数不是合法 JSON: {parse_error}"
-                        approved = False
-                        tool_span.mark_error(f"json decode: {parse_error}")
-                    else:
-                        # 审批 + 执行
+                # 提前算出哪些有 parse_error - 这些不进 executor, 直接错误返回
+                # 并行执行只针对参数 OK 的
+                from .parallel import execute_tools_parallel
+
+                ok_calls = [(tc, args) for tc, args, pe in parsed_calls if pe is None]
+                err_calls = {tc.id: pe for tc, _, pe in parsed_calls if pe}
+
+                # 构造 (call_id, name, args) 三元组
+                triplets = [(tc.id, tc.name, args) for tc, args in ok_calls]
+
+                def executor_fn(name: str, args: dict) -> tuple[str, bool]:
+                    """每个工具的执行: 审批 + 执行 + 写 span"""
+                    # 在并行线程里开 span - 注意 trace_ctx 是上下文管理器 wrapper
+                    # 我们的 trace_ctx.span 是支持线程安全的(spans 各自独立)
+                    with trace_ctx.span(
+                        SpanKind.TOOL_CALL,
+                        name=name,
+                    ) as tool_span:
+                        tool_span.set_payload("arguments", args)
                         result, approved = self._execute_tool_traced(
-                            tc.name, args, trace_ctx,
+                            name, args, trace_ctx,
                         )
+                        tool_span.set_payload("result", result)
+                        tool_span.set_attribute("approved", approved)
+                        if not approved:
+                            tool_span.mark_cancelled("not approved")
+                        return result, approved
 
-                    tool_span.set_payload("result", result)
-                    tool_span.set_attribute("approved", approved)
-                    if not approved:
-                        tool_span.mark_cancelled("not approved")
+                def needs_approval(name: str) -> bool:
+                    return self.approval_policy.decide(name) == Decision.ASK
 
-                yield ToolCallResult(tc.name, tc.id, result, approved=approved)
-                session.add_message({
-                    "role": "tool", "tool_call_id": tc.id, "content": result,
-                })
+                results = execute_tools_parallel(
+                    triplets, executor_fn, needs_approval, max_workers=4,
+                )
+
+                # 按原 parsed_calls 顺序 yield + 追加 session.messages
+                # parse_error 的提前发, 不会丢顺序
+                result_map = {r.call_id: r for r in results}
+                for tc, args, parse_error in parsed_calls:
+                    if parse_error is not None:
+                        result_str = f"[错误] 参数不是合法 JSON: {parse_error}"
+                        approved = False
+                        # 给一个 error span
+                        with trace_ctx.span(SpanKind.TOOL_CALL, name=tc.name) as s:
+                            s.set_payload("arguments", args)
+                            s.set_payload("result", result_str)
+                            s.mark_error(f"json decode: {parse_error}")
+                    else:
+                        r = result_map[tc.id]
+                        result_str = r.result
+                        approved = r.approved
+
+                    yield ToolCallResult(tc.name, tc.id, result_str, approved=approved)
+                    session.add_message({
+                        "role": "tool", "tool_call_id": tc.id, "content": result_str,
+                    })
 
         yield Aborted(f"达到最大轮次 ({self.max_iterations}), 强制结束")
+
+    def _render_tools_summary(self) -> str:
+        """简短列出工具名 + 一句描述, 给 planner 看"""
+        lines = []
+        for t in self.registry.all():
+            first_line = t.description.strip().split("\n")[0][:80]
+            lines.append(f"- {t.name}: {first_line}")
+        return "\n".join(lines)
+
+    def _execute_one_with_span(
+        self, name: str, call_id: str, args: dict, parse_error: str | None, trace_ctx,
+    ) -> tuple[str, bool]:
+        """单个工具执行 + span 包装(串行路径用)"""
+        with trace_ctx.span(
+            SpanKind.TOOL_CALL,
+            name=name,
+            tool_call_id=call_id,
+        ) as tool_span:
+            tool_span.set_payload("arguments", args)
+            if parse_error:
+                result = f"[错误] 参数不是合法 JSON: {parse_error}"
+                approved = False
+                tool_span.mark_error(f"json decode: {parse_error}")
+            else:
+                result, approved = self._execute_tool_traced(
+                    name, args, trace_ctx,
+                )
+            tool_span.set_payload("result", result)
+            tool_span.set_attribute("approved", approved)
+            if not approved:
+                tool_span.mark_cancelled("not approved")
+            return result, approved
 
     def _execute_tool_traced(
         self, name: str, arguments: dict, trace_ctx,

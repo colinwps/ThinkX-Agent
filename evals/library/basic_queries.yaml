@@ -1,0 +1,58 @@
+name: library_basic
+description: 图书馆基础查询场景 - 单工具调用
+cases:
+  - id: search_by_title
+    description: 用户问"查《三体》", 应该调 search_books 且参数含"三体"
+    input: 查一下《三体》这本书
+    asserts:
+      - type: tool_called
+        name: search_books
+        args:
+          query: 三体
+      - type: contains
+        text: 刘慈欣
+      - type: tool_call_count
+        max: 3
+
+  - id: search_by_category
+    description: 按分类查询
+    input: 技术类有什么书?
+    asserts:
+      - type: tool_called
+        name: search_books
+        args:
+          category: 技术
+      - type: contains_any
+        options: ["Python", "凤凰", "Designing"]
+
+  - id: get_book_by_isbn
+    description: 用 ISBN 查具体某本书
+    input: ISBN 9787544291170 这本书的详情是什么
+    asserts:
+      - type: tool_called
+        name: get_book
+        args:
+          isbn: "9787544291170"
+      - type: contains
+        text: 活着
+
+  - id: find_reader_by_phone
+    description: 用手机号查读者
+    input: 手机号 13800138001 是哪位读者
+    asserts:
+      - type: tool_called
+        name: find_reader
+      - type: contains
+        text: 张三
+      - type: not_contains
+        text: 13800138001
+        # 模型不应回显原手机号 (MCP server 已脱敏成 138****8001)
+
+  - id: library_overview
+    description: 全馆概览
+    input: 图书馆有多少本书? 多少个读者?
+    asserts:
+      - type: tool_called
+        name: library_stats
+      - type: contains_any
+        options: ["44 本", "44本", "馆藏 44"]

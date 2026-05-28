@@ -1,118 +1,127 @@
-# my-agent (v5: WebUI 演示)
+# ThinkX-Agent (v8: 评估体系)
 
 从零实现的最小 Agent 框架。
 
 ## 版本演进
 
-- **v1**: ReAct 主循环 + Tool 抽象 + MCP + Skill
-- **v2**: 会话化 + SQLite 持久化 + 流式输出 + 工具审批 + CLI REPL
-- **v3**: Trace/Span 可观测性 + 成本统计 + 脱敏 + 查看工具
-- **v4**: 稳健性子系统 + 真实业务接入(图书馆)
-- **v5**: ★ **React WebUI + 浏览器审批弹框**
+- **v1**: ReAct + Tool + MCP + Skill
+- **v2**: 会话化 + SQLite + 流式 + REPL
+- **v3**: Trace/Span 可观测性 + 成本/脱敏
+- **v4**: 稳健性 + 业务接入(图书馆)
+- **v5**: React WebUI + 审批弹框
+- **v6**: 上下文管理(token 估算 + 历史压缩)
+- **v7**: Plan-and-Execute + Reflection + 并行工具 + 多模型 cache
+- **v8**: ★ **评估体系: YAML cases + 多种断言 + LLM judge + A/B 对比**
 
-## v5 新增
+## v8 新增
 
-### React WebUI (`webui/`)
-- ✅ **单 HTML 文件** - CDN 引入 React 18 + Babel, 零 build
-- ✅ **流式打字效果** - SSE 实时推送, 字符逐个到达
-- ✅ **工具调用可视化** - 折叠/展开查看参数和结果
-- ✅ **会话管理** - 侧边栏列表 + 自动保存
-- ✅ **Token/成本实时统计** - 右上角和侧边栏底部
-- ✅ **工具面板** - 右抽屉看所有已注册工具
-- ✅ **审批弹框** - 危险工具弹模态框, 允许/拒绝(带理由)/超时
+### `agent/eval/` 子包
+- ✅ **YAML case 文件** - 测试场景版本化管理
+- ✅ **5 种程序断言** - ToolCalled / NoToolCalled / Contains / NotContains / ToolCallCount
+- ✅ **LLM-as-judge** - 主观质量评分(语义/风格类)
+- ✅ **SQLite 存储** - 历史 run 持久化, 可对比
+- ✅ **A/B 对比** - 找出 regressed / improved / 成本变化的 case
 
-### 审批桥接器 (`webui/approval_bridge.py`)
-- ✅ 跨线程通信: Agent 工作线程 ↔ HTTP 请求
-- ✅ `threading.Event` 信号 + 超时保护
-- ✅ 并发安全: 同时多个 pending 互不干扰
-
-## 项目结构
-
-```
-my-agent/
-├── agent/                           # v1-v4 的核心(完全复用)
-│   ├── core.py / session.py / cli.py / ...
-│   ├── tools/ skills/ observability/ robustness/
-├── mcp_servers/                     # v4 的图书馆 MCP server
-│   ├── demo_server.py
-│   └── library/
-├── webui/                           # ★ v5 新增
-│   ├── server.py                    #   FastAPI + SSE
-│   ├── approval_bridge.py           #   审批跨线程桥
-│   ├── static/index.html            #   单文件 React 应用
-│   └── README.md
-├── examples/                        # 10 个示例 (CLI 演示)
-├── skills/
-├── trace_cli.py
-├── requirements.txt
-└── README.md
+### `eval_cli.py`
+命令行入口:
+```bash
+python eval_cli.py run evals/library/basic_queries.yaml
+python eval_cli.py run evals/library/ --plan         # 加 plan 跑
+python eval_cli.py list                              # 历史
+python eval_cli.py compare <a> <b>                   # A/B
 ```
 
-## 快速开始
+### `evals/library/` 图书馆 eval cases
+- `basic_queries.yaml` - 5 个单工具场景
+- `multi_tool.yaml` - 3 个多工具组合
+- `quality.yaml` - 3 个含 LLM judge 的质量场景
 
-### 用浏览器对话 (v5 新增)
+## 完整能力总览
+
+```
+✓ 模型: DeepSeek/通义/智谱/Kimi
+✓ 工具: 本地 + MCP, 串行/并行
+✓ Skill: 按需加载
+✓ 会话: SQLite + 流式
+✓ 安全: CLI + Web 审批, 黑名单, 结果护栏
+✓ 观测: trace + 多模型 cache + 节省金额
+✓ 稳健: 重试退避超时
+✓ 上下文: 压缩 + 预算
+✓ 策略: Plan-and-Execute + Reflection
+✓ 业务: 图书馆 (6 MCP 工具)
+✓ 界面: CLI REPL + React WebUI
+✓ 评估: YAML cases + 断言 + LLM judge + A/B 对比
+```
+
+## v8 工作流: 用 eval 驱动改造
 
 ```bash
-pip install -r requirements.txt
-cp .env.example .env  # 填 DEEPSEEK_API_KEY
+# 1. 跑当前配置, 拿 baseline
+python eval_cli.py run evals/library/
 
-python -m webui.server
-# 浏览器打开 http://localhost:8765
+# 2. 改个东西 (比如开 plan)
+python eval_cli.py run evals/library/ --plan
+
+# 3. 对比
+python eval_cli.py list   # 看到两个 run_id
+python eval_cli.py compare <baseline_id> <new_id>
+
+# 输出:
+#   通过率变化: +5.0%
+#   成本变化: $+0.0023
+#   Case 级:
+#     - search_book   same      成本变化 $+0.0008
+#     - reader_loans  improved  A: FAIL, B: PASS ✨
+#     - hot_books     regressed A: PASS, B: FAIL ⚠
 ```
 
-### 用 CLI 对话 (v2-v4 已有)
+**关键价值**: 不再靠"感觉"判断改动好坏, 用客观数据。
 
-```bash
-python -m examples.07_repl              # 通用 REPL
-python -m examples.10_library_agent     # 图书馆 REPL
+## 写自己的 eval
+
+`evals/your_business/your_suite.yaml`:
+
+```yaml
+name: my_business
+description: 我的业务测试集
+cases:
+  - id: typical_query
+    input: "用户问的典型问题"
+    asserts:
+      - type: tool_called
+        name: search_xxx
+        args:
+          q: "关键词"
+      - type: contains
+        text: "预期答案片段"
+
+  - id: edge_case
+    input: "边界场景"
+    asserts:
+      - type: no_tool_called
+        name: dangerous_tool
+      - type: llm_judge
+        criteria: |
+          助手的回答是否礼貌地拒绝了越权请求?
+        threshold: 7
 ```
 
-### 跑示例
+跑: `python eval_cli.py run evals/your_business/`
 
-```bash
-python -m examples.09_robustness        # 稳健性能力演示
-python trace_cli.py list                 # 查 trace
-```
-
-## 推荐学习顺序
-
-按 example 数字 → webui → 业务接入:
-
-1. `01_minimal_loop.py` - **看清 Agent 本质**就是 `while + tool 调用`
-2. `02_with_tools.py` - 抽象的 Tool 系统
-3. `03_with_mcp.py` - 怎么把工具"外置"成 MCP
-4. `04_with_skills.py` - 按需加载的方法论
-5. `05_chat.py` - 会话化(v2)
-6. `06_streaming.py` - 流式输出(v2)
-7. `07_repl.py` - CLI REPL + 可观测性(v2+v3)
-8. `08_tracing.py` - 单独看 trace 系统(v3)
-9. `09_robustness.py` - 稳健性子系统(v4)
-10. `10_library_agent.py` - 真实业务(v4)
-11. **`webui/`** - 浏览器版本(v5)
-
-## 全部能力总览
+## 项目文件清单
 
 ```
-✓ 模型: DeepSeek/通义/智谱/Kimi 任意切换
-✓ 工具: 本地 + MCP 双源, schema 自动生成
-✓ Skill: 按需加载的方法论
-✓ 会话: SQLite 持久化, 流式输出
-✓ 安全: 工具审批(CLI + 浏览器弹框), 命令黑名单, 结果护栏
-✓ 观测: 完整 trace + token/成本 + 脱敏 + Rich UI 查看
-✓ 稳健: LLM/MCP 自动重试 + 退避, 超时
-✓ 业务: 完整图书馆查询助手 (6 个 MCP 工具)
-✓ 界面: CLI REPL + React WebUI 双端
-```
-
-## 文件清单
-
-50 个 Python 文件 + 1 个 HTML + 6 个 markdown:
-
-```
-agent/                  17 个 py 文件
-mcp_servers/            5 个 py 文件
-skills/                 1 个 py 文件 + 2 个 SKILL.md
-examples/               10 个 py 文件
-webui/                  3 个 py 文件 + 1 个 html
-trace_cli.py            1 个 py 文件
+agent/
+├── core.py / session.py / approval.py / streaming.py / cli.py
+├── tools/ skills/ observability/ robustness/ context/ strategies/
+├── parallel.py
+└── eval/                            # ★ v8
+    ├── case.py / assertions.py / judge.py
+    ├── runner.py / store.py / viewer.py
+mcp_servers/library/
+webui/
+examples/01-15
+evals/library/                       # ★ v8 业务 cases
+eval_cli.py                          # ★ v8
+trace_cli.py
 ```

@@ -226,6 +226,7 @@ def record_llm_usage(span: Span, model: str, usage) -> None:
     """
     把 LLM 调用的 usage 信息写入 span(自动算成本)
     usage 可以是 openai 的 usage 对象, 也可以是 dict
+    cache 命中字段按模型自适应读取(DeepSeek/通义/智谱/Kimi 字段名不同)
     """
     if usage is None:
         return
@@ -233,12 +234,13 @@ def record_llm_usage(span: Span, model: str, usage) -> None:
     if hasattr(usage, "prompt_tokens"):
         p = usage.prompt_tokens or 0
         c = usage.completion_tokens or 0
-        details = getattr(usage, "prompt_tokens_details", None)
-        cached = getattr(details, "cached_tokens", 0) if details else 0
     else:
         p = usage.get("prompt_tokens", 0)
         c = usage.get("completion_tokens", 0)
-        cached = usage.get("cached_tokens", 0)
+
+    # 统一从各家 usage 字段读 cached
+    from .pricing import extract_cache_info
+    cached = extract_cache_info(model, usage)
 
     cost = estimate_cost(model, p, c, cached)
 

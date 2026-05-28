@@ -415,7 +415,7 @@ class REPL:
 
         # 欢迎语
         console.print(Panel.fit(
-            "[bold cyan]ThinkX-Agent REPL[/]\n"
+            "[bold cyan]my-agent REPL[/]\n"
             f"会话 ID: [yellow]{self.session.id}[/]\n"
             f"模型: [green]{self.agent.model}[/]\n"
             f"工具: {len(self.agent.registry)} 个\n"

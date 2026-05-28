@@ -106,3 +106,59 @@ def format_cost(cost_usd: float) -> str:
     if cost_usd < 0.01:
         return f"${cost_usd:.4f}"
     return f"${cost_usd:.4f}"
+
+
+# ============================================================
+# 多模型 cache 字段统一读取
+# ============================================================
+# 各家的 usage 字段不一样, 这里统一抽出来:
+#
+# DeepSeek:  usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
+#            (新版也会在 prompt_tokens_details.cached_tokens 出现)
+# 通义/智谱: usage.prompt_tokens_details.cached_tokens
+# Kimi:      usage.cached_tokens (顶层字段)
+# OpenAI:    usage.prompt_tokens_details.cached_tokens
+
+def extract_cache_info(model: str, usage) -> int:
+    """
+    从 usage 对象里读出 cached_tokens 数。
+    usage 可以是 SDK 对象, 也可以是 dict。
+    读不到返回 0。
+    """
+    if usage is None:
+        return 0
+
+    def _get(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    model_lower = (model or "").lower()
+
+    # DeepSeek 风格: 直接顶层有 prompt_cache_hit_tokens
+    if "deepseek" in model_lower:
+        hit = _get(usage, "prompt_cache_hit_tokens")
+        if hit is not None:
+            return int(hit or 0)
+        # 新版可能也用通用字段, fallthrough
+
+    # Kimi 风格: 顶层 cached_tokens
+    if "moonshot" in model_lower or "kimi" in model_lower:
+        c = _get(usage, "cached_tokens")
+        if c is not None:
+            return int(c or 0)
+
+    # OpenAI 兼容字段(通义/智谱/新版 DeepSeek 都用这个):
+    # usage.prompt_tokens_details.cached_tokens
+    details = _get(usage, "prompt_tokens_details")
+    if details is not None:
+        cached = _get(details, "cached_tokens")
+        if cached is not None:
+            return int(cached or 0)
+
+    # 兜底: 找一个明显的 'cached' 字段
+    c = _get(usage, "cached_tokens")
+    if c is not None:
+        return int(c or 0)
+
+    return 0
